@@ -30,6 +30,7 @@ aiping — HTTP → 可点击桌面通知网关
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -48,6 +49,146 @@ PORT = int(os.environ.get("AIPING_PORT", "8787"))
 TOKEN = os.environ.get("AIPING_TOKEN", "")
 APP = os.environ.get("AIPING_APP", "Aiping")
 MAX_ALERTS = 500
+
+# SQLite 持久化：告警存数据库，重启不丢
+DB_PATH = os.path.expanduser("~/.local/share/aiping/alerts.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+DB_LOCK = threading.Lock()
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_db():
+    conn = _get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY,
+            title TEXT, body TEXT, urgency INTEGER, urgency_label TEXT,
+            icon TEXT, detail TEXT, fields TEXT, extra TEXT, raw TEXT,
+            ts TEXT, ts_sort TEXT, read INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_sort ON alerts(ts_sort DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_urgency ON alerts(urgency)")
+    conn.commit()
+    conn.close()
+
+
+def _db_save(record: dict):
+    """插入或覆盖一条告警。"""
+    with DB_LOCK:
+        conn = _get_db()
+        conn.execute("""
+            INSERT OR REPLACE INTO alerts
+            (id,title,body,urgency,urgency_label,icon,detail,fields,extra,raw,ts,ts_sort,read)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            record["id"], record["title"], record["body"],
+            record["urgency"], record["urgency_label"],
+            record.get("icon", ""), record.get("detail", ""),
+            json.dumps(record.get("fields", {}), ensure_ascii=False),
+            json.dumps(record.get("extra", {}), ensure_ascii=False),
+            json.dumps(record.get("raw", {}), ensure_ascii=False),
+            record["ts"], record["ts_sort"],
+            record.get("read", 0),
+        ))
+        conn.commit()
+        conn.close()
+
+
+def _db_load_all() -> list:
+    """加载全部告警，按 ts_sort 倒序。"""
+    with DB_LOCK:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT * FROM alerts ORDER BY ts_sort DESC"
+        ).fetchall()
+        conn.close()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"], "title": r["title"], "body": r["body"],
+            "urgency": r["urgency"], "urgency_label": r["urgency_label"],
+            "icon": r["icon"], "detail": r["detail"],
+            "fields": json.loads(r["fields"] or "{}"),
+            "extra": json.loads(r["extra"] or "{}"),
+            "raw": json.loads(r["raw"] or "{}"),
+            "ts": r["ts"], "ts_sort": r["ts_sort"],
+            "read": r["read"],
+        })
+    return result
+
+
+def _db_load_one(alert_id: str) -> dict | None:
+    with DB_LOCK:
+        conn = _get_db()
+        r = conn.execute(
+            "SELECT * FROM alerts WHERE id=?", (alert_id,)
+        ).fetchone()
+        conn.close()
+    if not r:
+        return None
+    return {
+        "id": r["id"], "title": r["title"], "body": r["body"],
+        "urgency": r["urgency"], "urgency_label": r["urgency_label"],
+        "icon": r["icon"], "detail": r["detail"],
+        "fields": json.loads(r["fields"] or "{}"),
+        "extra": json.loads(r["extra"] or "{}"),
+        "raw": json.loads(r["raw"] or "{}"),
+        "ts": r["ts"], "ts_sort": r["ts_sort"],
+        "read": r["read"],
+    }
+
+
+def _db_mark_read(alert_id: str):
+    with DB_LOCK:
+        conn = _get_db()
+        conn.execute("UPDATE alerts SET read=1 WHERE id=?", (alert_id,))
+        conn.commit()
+        conn.close()
+
+
+def _db_count() -> int:
+    with DB_LOCK:
+        conn = _get_db()
+        n = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        conn.close()
+    return n
+
+
+def _db_trim():
+    """超过 MAX_ALERTS 时删除最早的。"""
+    with DB_LOCK:
+        conn = _get_db()
+        n = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        if n > MAX_ALERTS:
+            conn.execute("""
+                DELETE FROM alerts WHERE id IN (
+                    SELECT id FROM alerts ORDER BY ts_sort ASC LIMIT ?
+                )
+            """, (n - MAX_ALERTS,))
+            conn.commit()
+        conn.close()
+
+
+# 内存缓存（从 DB 加载，读操作走缓存避免每次查库）
+ALERTS_CACHE: list = []
+CACHE_LOCK = threading.Lock()
+
+
+def _refresh_cache():
+    global ALERTS_CACHE
+    with CACHE_LOCK:
+        ALERTS_CACHE = _db_load_all()
+
+
+_init_db()
+_refresh_cache()
 
 def _detect_xauthority() -> str:
     """GNOME Wayland 把 X 授权放 /run/user/$UID/.mutter-Xwaylandauth.*，
@@ -73,10 +214,6 @@ AIPING_ENV = {
 }
 URGENCY_LEVELS = {"low": 0, "normal": 1, "critical": 2}
 URGENCY_LABEL = {0: "low", 1: "normal", 2: "critical"}
-
-# 告警存储：id -> {id,title,body,urgency,detail,fields,ts}
-ALERTS: dict[str, dict] = {}
-ALERTS_LOCK = threading.Lock()
 
 _glib_loop: GLib.MainLoop | None = None
 
@@ -183,15 +320,15 @@ table.kv td:last-child{color:var(--fg);word-break:break-word}
 # 主题变量定义（详情页和列表页共用）
 _THEME_VARS = """
 :root,[data-theme=light]{--bg:#f6f8fa;--fg:#1f2328;--card:#fff;--muted:#6b7280;--border:#e1e4e8;
-  --row-border:#f0f0f0;--th-bg:#fafbfc;--hover:#f9fafb;--shadow:rgba(0,0,0,.05);--link:#0969da}
+  --row-border:#f0f0f0;--th-bg:#fafbfc;--hover:#f9fafb;--shadow:rgba(0,0,0,.05);--link:#0969da;--unread-bg:#eef4ff}
 [data-theme=dark]{--bg:#0d1117;--fg:#e6edf3;--card:#161b22;--muted:#8b949e;--border:#30363d;
-  --row-border:#21262d;--th-bg:#161b22;--hover:#1c2128;--shadow:rgba(0,0,0,.3);--link:#58a6ff}
+  --row-border:#21262d;--th-bg:#161b22;--hover:#1c2128;--shadow:rgba(0,0,0,.3);--link:#58a6ff;--unread-bg:#1a2332}
 [data-theme=green]{--bg:#e8f0e5;--fg:#2d3a2e;--card:#f7faf5;--muted:#5a7260;--border:#c5d6c0;
-  --row-border:#dce8d8;--th-bg:#f0f5ec;--hover:#eef4ea;--shadow:rgba(45,58,46,.08);--link:#2d8c5a}
+  --row-border:#dce8d8;--th-bg:#f0f5ec;--hover:#eef4ea;--shadow:rgba(45,58,46,.08);--link:#2d8c5a;--unread-bg:#eaf4e8}
 [data-theme=warm]{--bg:#fdf6ec;--fg:#5c4a2e;--card:#fffaf2;--muted:#9a8260;--border:#e8d5b8;
-  --row-border:#f0e2cc;--th-bg:#faf3e8;--hover:#fcf5ea;--shadow:rgba(92,74,46,.06);--link:#c47b3a}
+  --row-border:#f0e2cc;--th-bg:#faf3e8;--hover:#fcf5ea;--shadow:rgba(92,74,46,.06);--link:#c47b3a;--unread-bg:#fbf2e4}
 [data-theme=nightblue]{--bg:#0a1628;--fg:#c8d6e8;--card:#14213d;--muted:#6b7fa0;--border:#2a3f5f;
-  --row-border:#1e3050;--th-bg:#162447;--hover:#1a2d52;--shadow:rgba(0,0,0,.3);--link:#4a9eff}
+  --row-border:#1e3050;--th-bg:#162447;--hover:#1a2d52;--shadow:rgba(0,0,0,.3);--link:#4a9eff;--unread-bg:#11204a}
 """
 
 _THEME_SCRIPT = """
@@ -239,6 +376,12 @@ a:hover{text-decoration:underline}
 .pager-btns a:hover{background:var(--hover);text-decoration:none}
 .pager-btns .current{background:var(--link);color:#fff;border-color:var(--link)}
 .pager-btns .disabled{color:var(--muted);opacity:.5;cursor:default}
+/* 已读/未读状态 */
+tr.unread{background:var(--unread-bg)}
+tr.unread td:first-child{border-left:3px solid var(--link)}
+tr.read{opacity:.7}
+.title-unread{color:var(--link);font-weight:600}
+.title-read{color:var(--muted);font-weight:400}
 .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .theme-select,.filter-select{padding:5px 10px;border:1px solid var(--border);border-radius:6px;
   background:var(--card);color:var(--fg);font-size:13px;cursor:pointer}
@@ -253,9 +396,9 @@ PAGE_SIZE = 100
 
 
 def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
-    with ALERTS_LOCK:
-        all_items = sorted(ALERTS.values(),
-                           key=lambda x: x.get("ts_sort", ""), reverse=True)
+    # 从缓存读取（缓存由 DB 刷新）
+    with CACHE_LOCK:
+        all_items = list(ALERTS_CACHE)
     # 级别筛选
     if urgency_filter in ("critical", "normal", "low"):
         target_val = URGENCY_LEVELS[urgency_filter]
@@ -316,12 +459,14 @@ def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
         u = a.get("urgency", 1)
         ulabel = URGENCY_LABEL.get(u, "normal")
         aid = escape(a.get("id", ""))
-        row_cls = " class=viewed" if a.get("viewed") else ""
+        is_read = a.get("read", 0)
+        row_cls = "read" if is_read else "unread"
+        title_cls = "title-read" if is_read else "title-unread"
         parts.append(
-            f"<tr{row_cls}><td class=mono>{aid}</td>"
+            f"<tr class={row_cls}><td class=mono>{aid}</td>"
             f"<td class=mono>{escape(a.get('ts',''))}</td>"
             f"<td><span class='badge {ulabel}'>{ulabel}</span></td>"
-            f"<td><a href='/alert/{aid}'>{escape(a.get('title',''))}</a></td>"
+            f"<td><a href='/alert/{aid}' class='{title_cls}'>{escape(a.get('title',''))}</a></td>"
             f"<td>{escape(a.get('body','')[:80])}</td></tr>"
         )
     parts.append("</tbody></table>")
@@ -471,7 +616,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/health"):
             self._json(200, {"ok": True, "service": "aiping", "app": APP,
-                             "auth": bool(TOKEN), "alerts": len(ALERTS)})
+                             "auth": bool(TOKEN), "alerts": _db_count()})
             return
         if path == "/alerts":
             # 解析 page 和 urgency 参数
@@ -490,14 +635,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/alert/"):
             aid = path[len("/alert/"):]
-            with ALERTS_LOCK:
-                a = ALERTS.get(aid)
-                if a is not None:
-                    a["viewed"] = True
+            a = _db_load_one(aid)
             if not a:
                 self._send(404, "text/html; charset=utf-8",
                            "<h1>404</h1><p>告警不存在或已被清理</p>".encode())
                 return
+            # 标记已读
+            _db_mark_read(aid)
+            a["read"] = 1
+            _refresh_cache()
             self._send(200, "text/html; charset=utf-8", _render_detail(a))
             return
         self._json(404, {"error": "not found"})
@@ -539,18 +685,22 @@ class Handler(BaseHTTPRequestHandler):
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ts_sort": datetime.now().strftime("%Y%m%d%H%M%S"),
             "raw": payload,
+            "read": 0,
         }
-        with ALERTS_LOCK:
-            ALERTS[alert_id] = record
-            if len(ALERTS) > MAX_ALERTS:
-                # 按插入顺序淘汰最早的（Python3.7+ dict 有序）
-                ALERTS.pop(next(iter(ALERTS)))
+        # 持久化到 SQLite
+        _db_save(record)
+        _db_trim()
+        _refresh_cache()
 
-        # 投递到 GLib 主线程弹通知（add_action 必须在拥有 Notify 的线程）
-        GLib.idle_add(_show_notification, alert_id, title, body, urgency_val, icon)
+        # 只有 critical 级别弹桌面通知，其他级别只记录不通知
+        notified = False
+        if urgency_val == 2:
+            GLib.idle_add(_show_notification, alert_id, title, body, urgency_val, icon)
+            notified = True
 
         self._json(200, {"ok": True, "id": alert_id, "title": title,
                          "urgency": urgency,
+                         "notified": notified,
                          "detail_url": f"http://127.0.0.1:{PORT}/alert/{alert_id}"})
 
     def log_message(self, fmt, *args):
