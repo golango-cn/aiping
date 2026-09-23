@@ -225,6 +225,8 @@ tr:hover{background:var(--hover)}
 .badge.critical{background:#dc2626}
 .badge.normal{background:#2563eb}
 .badge.low{background:#9ca3af}
+tr.viewed td a{color:var(--muted)}
+tr.viewed td a:hover{color:var(--muted);text-decoration:none}
 .empty{color:var(--muted);padding:40px;text-align:center;font-size:14px}
 .mono{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;color:var(--muted)}
 a{color:var(--link);text-decoration:none}
@@ -314,8 +316,9 @@ def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
         u = a.get("urgency", 1)
         ulabel = URGENCY_LABEL.get(u, "normal")
         aid = escape(a.get("id", ""))
+        row_cls = " class=viewed" if a.get("viewed") else ""
         parts.append(
-            f"<tr><td class=mono>{aid}</td>"
+            f"<tr{row_cls}><td class=mono>{aid}</td>"
             f"<td class=mono>{escape(a.get('ts',''))}</td>"
             f"<td><span class='badge {ulabel}'>{ulabel}</span></td>"
             f"<td><a href='/alert/{aid}'>{escape(a.get('title',''))}</a></td>"
@@ -489,6 +492,8 @@ class Handler(BaseHTTPRequestHandler):
             aid = path[len("/alert/"):]
             with ALERTS_LOCK:
                 a = ALERTS.get(aid)
+                if a is not None:
+                    a["viewed"] = True
             if not a:
                 self._send(404, "text/html; charset=utf-8",
                            "<h1>404</h1><p>告警不存在或已被清理</p>".encode())
