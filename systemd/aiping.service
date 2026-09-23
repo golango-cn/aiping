@@ -1,0 +1,24 @@
+[Unit]
+Description=aiping — HTTP to desktop notification for AI agents
+Documentation=https://github.com/golango-cn/aiping
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aiping.py
+# 桌面会话环境：notify-send 必须拿到 DBus 才能弹通知
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# 监听配置：默认只本机。远程调用改 AIPING_HOST=0.0.0.0 并设 AIPING_TOKEN
+#Environment=AIPING_HOST=0.0.0.0
+#Environment=AIPING_TOKEN=change-me-please
+Environment=AIPING_APP=Aiping
+Restart=on-failure
+RestartSec=3
+# 日志进 journal，用 journalctl --user -u aiping -f 看
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

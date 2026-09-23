@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.playwright-mcp/
+*.log
+.DS_Store
