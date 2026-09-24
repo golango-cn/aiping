@@ -22,7 +22,7 @@ aiping — HTTP → 可点击桌面通知网关
       "id":"cpu-17723",            # 可选，幂等 id；不传自动生成
       "title":"巡检告警",
       "body":"177.23 CPU 95%",
-      "urgency":"critical",         # low/normal/critical
+      "urgency":"加急",            # 一般/普通/重要/加急
       "detail":"多行详细说明\\nTOP: java pid=1234",   # 可选，详情页正文
       "fields":{"主机":"177.23","负载":9.8}            # 可选，键值表格
     }'
@@ -212,8 +212,10 @@ AIPING_ENV = {
     "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
     "HOME": os.environ.get("HOME", os.path.expanduser("~")),
 }
-URGENCY_LEVELS = {"low": 0, "normal": 1, "critical": 2}
-URGENCY_LABEL = {0: "low", 1: "normal", 2: "critical"}
+URGENCY_LEVELS = {"一般": 0, "普通": 1, "重要": 2, "加急": 3}
+URGENCY_LABEL = {0: "一般", 1: "普通", 2: "重要", 3: "加急"}
+# 通知阈值：重要(2) 及以上才弹桌面通知
+NOTIFY_THRESHOLD = 2
 
 _glib_loop: GLib.MainLoop | None = None
 
@@ -225,11 +227,12 @@ LIVE_NOTIFS: set = set()
 
 # ---------- 通知 ----------
 
-# 按 urgency 选系统图标，不靠中文标记级别
+# 按级别选系统图标
 URGENCY_ICON = {
-    0: "dialog-information",   # low
-    1: "dialog-information",   # normal
-    2: "dialog-warning",       # critical
+    0: "dialog-information",   # 一般
+    1: "dialog-information",   # 普通
+    2: "dialog-warning",       # 重要
+    3: "dialog-error",         # 加急
 }
 
 
@@ -284,9 +287,10 @@ h1{font-size:22px;margin:0 0 6px;font-weight:600;line-height:1.3}
 .meta{color:var(--muted);font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;
   font-weight:600;color:#fff;letter-spacing:.3px}
-.badge.critical{background:#dc2626}
-.badge.normal{background:#2563eb}
-.badge.low{background:#9ca3af}
+.badge.加急{background:#dc2626}
+.badge.重要{background:#ea580c}
+.badge.普通{background:#2563eb}
+.badge.一般{background:#9ca3af}
 .sep{color:var(--border)}
 .mono{font-family:ui-monospace,SFMono-Regular,"Cascadia Code",monospace;font-size:12px;color:var(--muted)}
 .section{margin-top:22px}
@@ -359,9 +363,10 @@ th{background:var(--th-bg);color:var(--muted);font-weight:600;font-size:12px;tex
 tr:last-child td{border-bottom:none}
 tr:hover{background:var(--hover)}
 .badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:11px;font-weight:600;color:#fff}
-.badge.critical{background:#dc2626}
-.badge.normal{background:#2563eb}
-.badge.low{background:#9ca3af}
+.badge.加急{background:#dc2626}
+.badge.重要{background:#ea580c}
+.badge.普通{background:#2563eb}
+.badge.一般{background:#9ca3af}
 tr.viewed td a{color:var(--muted)}
 tr.viewed td a:hover{color:var(--muted);text-decoration:none}
 .empty{color:var(--muted);padding:40px;text-align:center;font-size:14px}
@@ -400,7 +405,7 @@ def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
     with CACHE_LOCK:
         all_items = list(ALERTS_CACHE)
     # 级别筛选
-    if urgency_filter in ("critical", "normal", "low"):
+    if urgency_filter in ("一般", "普通", "重要", "加急"):
         target_val = URGENCY_LEVELS[urgency_filter]
         all_items = [a for a in all_items if a.get("urgency", 1) == target_val]
     total = len(all_items)
@@ -431,9 +436,10 @@ def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
              '<div class=toolbar>',
              '<select class=filter-select id=urgency-filter onchange="applyFilter()">',
              f'<option value=""{" selected" if not urgency_filter else ""}>全部级别</option>',
-             f'<option value=critical{" selected" if urgency_filter=="critical" else ""}>Critical</option>',
-             f'<option value=normal{" selected" if urgency_filter=="normal" else ""}>Normal</option>',
-             f'<option value=low{" selected" if urgency_filter=="low" else ""}>Low</option>',
+             f'<option value=加急{" selected" if urgency_filter=="加急" else ""}>加急</option>',
+             f'<option value=重要{" selected" if urgency_filter=="重要" else ""}>重要</option>',
+             f'<option value=普通{" selected" if urgency_filter=="普通" else ""}>普通</option>',
+             f'<option value=一般{" selected" if urgency_filter=="一般" else ""}>一般</option>',
              '</select>',
              '<select class=theme-select id=theme-sel>',
              '<option value=light>浅色</option>',
@@ -457,7 +463,7 @@ def _render_list(page: int = 1, urgency_filter: str = "") -> bytes:
         parts.append('<tr><td colspan=5 class=empty>暂无告警</td></tr>')
     for a in items:
         u = a.get("urgency", 1)
-        ulabel = URGENCY_LABEL.get(u, "normal")
+        ulabel = URGENCY_LABEL.get(u, "普通")
         aid = escape(a.get("id", ""))
         is_read = a.get("read", 0)
         row_cls = "read" if is_read else "unread"
@@ -521,7 +527,7 @@ function resetAR(){
 
 def _render_detail(a: dict) -> bytes:
     urgency = a.get("urgency", 1)
-    ulabel = URGENCY_LABEL.get(urgency, "normal")
+    ulabel = URGENCY_LABEL.get(urgency, "普通")
     ts = a.get("ts", "")
     body = a.get("body", "")
     detail = a.get("detail", "")
@@ -619,7 +625,8 @@ class Handler(BaseHTTPRequestHandler):
                              "auth": bool(TOKEN), "alerts": _db_count()})
             return
         if path == "/alerts":
-            # 解析 page 和 urgency 参数
+            # 解析 page 和 urgency 参数（中文需 URL 解码）
+            from urllib.parse import unquote
             page = 1
             urgency_f = ""
             for kv in query.split("&"):
@@ -629,7 +636,7 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         page = 1
                 elif kv.startswith("urgency="):
-                    urgency_f = kv[8:]
+                    urgency_f = unquote(kv[8:])
             self._send(200, "text/html; charset=utf-8",
                        _render_list(page, urgency_f))
             return
@@ -665,7 +672,7 @@ class Handler(BaseHTTPRequestHandler):
         alert_id = str(payload.get("id") or "").strip() or uuid.uuid4().hex[:10]
         title = str(payload.get("title", "通知")).strip() or "通知"
         body = str(payload.get("body", "")).strip()
-        urgency = str(payload.get("urgency", "normal")).lower()
+        urgency = str(payload.get("urgency", "普通"))
         urgency_val = URGENCY_LEVELS.get(urgency, 1)
         icon = str(payload.get("icon", "")).strip()
         detail = str(payload.get("detail", ""))
@@ -692,9 +699,9 @@ class Handler(BaseHTTPRequestHandler):
         _db_trim()
         _refresh_cache()
 
-        # 只有 critical 级别弹桌面通知，其他级别只记录不通知
+        # 只有重要(2)和加急(3)级别弹桌面通知，一般/普通只记录不通知
         notified = False
-        if urgency_val == 2:
+        if urgency_val >= NOTIFY_THRESHOLD:
             GLib.idle_add(_show_notification, alert_id, title, body, urgency_val, icon)
             notified = True
 
